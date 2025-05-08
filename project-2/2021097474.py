@@ -9,6 +9,7 @@ class DecisionTreeNode:
         self.label = label      # 예측 클래스 (리프 노드인 경우)
         self.attribute = attribute  # 분할에 사용된 속성
         self.children = {}      # 자식 노드 (속성값 → 노드)
+        self.class_distribution = None  # 클래스 분포 저장
 
     def __str__(self):
         if self.is_leaf:
@@ -17,68 +18,114 @@ class DecisionTreeNode:
 
 class DecisionTree:
     """결정 트리 분류기"""
-    def __init__(self):
+    def __init__(self, max_depth=None, min_samples_split=2):
         self.root = None  # 루트 노드
         self.attr_names = None  # 속성 이름 목록
         self.class_name = None  # 클래스 속성 이름
+        self.max_depth = max_depth  # 최대 트리 깊이 (None=무제한)
+        self.min_samples_split = min_samples_split  # 분할에 필요한 최소 샘플 수
+        self.classes = None  # 가능한 클래스 목록 (알파벳 순)
     
     def fit(self, data, header):
         """결정 트리 학습"""
         self.attr_names = header[:-1]  # 마지막은 클래스 속성
         self.class_name = header[-1]
         
-        # 속성 이름에서 속성 목록 추출 (마지막 클래스 제외)
-        attributes = [name for name in header[:-1]]
-        
-        # 데이터에서 X(입력 속성들)와 y(클래스) 분리 -> X: 속성들, y: 클래스
+        # 데이터에서 X(입력 속성들)와 y(클래스) 분리
         X = [row[:-1] for row in data]
         y = [row[-1] for row in data]
         
+        # 가능한 클래스들을 알파벳 순서로 저장 (일관성을 위해)
+        self.classes = sorted(set(y))
+        
         # 트리 생성
-        self.root = self._build_tree(X, y, attributes)
+        self.root = self._build_tree(X, y, self.attr_names.copy(), depth=0)
         
-    def _build_tree(self, X, y, attributes):
+    def _build_tree(self, X, y, attributes, depth=0):
         """재귀적으로 결정 트리 생성"""
-        # 모든 샘플이 같은 클래스인 경우 (종료 조건 1)
-        if len(set(y)) == 1:
-            return DecisionTreeNode(is_leaf=True, label=y[0])
+        # 노드에 클래스 분포 저장을 위한 카운터 생성
+        class_counts = Counter(y)
         
-        # 속성이 없거나, 같은 속성값 조합이 서로 다른 클래스를 가지는 경우 (종료 조건 2)
+        # 종료 조건 1: 모든 샘플이 같은 클래스
+        if len(class_counts) == 1:
+            node = DecisionTreeNode(is_leaf=True, label=y[0])
+            node.class_distribution = class_counts
+            return node
+        
+        # 종료 조건 2: 최대 깊이 도달
+        if self.max_depth is not None and depth >= self.max_depth:
+            # 다수결로 클래스 결정 (동점시 알파벳 순)
+            majority_class = self._get_majority_class(class_counts)
+            node = DecisionTreeNode(is_leaf=True, label=majority_class)
+            node.class_distribution = class_counts
+            return node
+        
+        # 종료 조건 3: 속성이 없거나 모든 속성값이 같음
         if not attributes or self._all_same_attributes(X):
-            majority_class = Counter(y).most_common(1)[0][0]
-            return DecisionTreeNode(is_leaf=True, label=majority_class)
+            majority_class = self._get_majority_class(class_counts)
+            node = DecisionTreeNode(is_leaf=True, label=majority_class)
+            node.class_distribution = class_counts
+            return node
+        
+        # 종료 조건 4: 최소 샘플 수 미달
+        if len(y) < self.min_samples_split:
+            majority_class = self._get_majority_class(class_counts)
+            node = DecisionTreeNode(is_leaf=True, label=majority_class)
+            node.class_distribution = class_counts
+            return node
         
         # 최적의 속성 선택 (gain ratio 기준)
         best_attr_idx = self._select_best_attribute(X, y, attributes)
+        
+        # 유효한 속성을 찾지 못한 경우
+        if best_attr_idx == -1:
+            majority_class = self._get_majority_class(class_counts)
+            node = DecisionTreeNode(is_leaf=True, label=majority_class)
+            node.class_distribution = class_counts
+            return node
+            
         best_attr = attributes[best_attr_idx]
+        best_attr_col_idx = self.attr_names.index(best_attr)  # X 데이터에서의 열 인덱스
         
         # 새로운 의사결정 노드 생성
         node = DecisionTreeNode(attribute=best_attr)
+        node.class_distribution = class_counts
         
-        # 선택된 속성을 제외한 새로운 속성 리스트 
-        new_attributes = list(attributes) # 리스트 복사
+        # 선택된 속성을 제외한 새로운 속성 리스트
+        new_attributes = list(attributes)
         new_attributes.pop(best_attr_idx)
         
-        # 각 속성값에 대한 서브트리 생성
-        attr_values = self._get_unique_values(X, best_attr_idx)
+        # 각 속성값에 대한 서브트리 생성 (정렬된 순서로 처리)
+        attr_values = sorted(set(x[best_attr_col_idx] for x in X))
         
         for value in attr_values:
             # 해당 속성값을 가진 샘플들 찾기
-            indices = [i for i, x in enumerate(X) if x[best_attr_idx] == value]
+            indices = [i for i, x in enumerate(X) if x[best_attr_col_idx] == value]
             
             # 해당 서브셋이 비어있으면 다수결로 리프 노드 생성
             if not indices:
-                majority_class = Counter(y).most_common(1)[0][0]
-                node.children[value] = DecisionTreeNode(is_leaf=True, label=majority_class)
+                majority_class = self._get_majority_class(class_counts)
+                leaf = DecisionTreeNode(is_leaf=True, label=majority_class)
+                leaf.class_distribution = class_counts
+                node.children[value] = leaf
             else:
                 # 서브셋 생성
                 sub_X = [X[i] for i in indices]
                 sub_y = [y[i] for i in indices]
                 
                 # 재귀적으로 서브트리 구축
-                node.children[value] = self._build_tree(sub_X, sub_y, new_attributes)
+                node.children[value] = self._build_tree(sub_X, sub_y, new_attributes, depth+1)
         
         return node
+    
+    def _get_majority_class(self, counter):
+        """다수결 클래스 반환 (동점일 경우 알파벳 순서로 첫 번째 선택)"""
+        # 가장 많은 개수를 가진 클래스들 찾기
+        max_count = counter.most_common(1)[0][1] if counter else 0
+        max_classes = [cls for cls, count in counter.items() if count == max_count]
+        
+        # 동점이면 알파벳 순 첫 번째 반환
+        return sorted(max_classes)[0] if max_classes else (self.classes[0] if self.classes else None)
     
     def _all_same_attributes(self, X):
         """모든 샘플이 같은 속성값을 가지는지 확인"""
@@ -91,24 +138,41 @@ class DecisionTree:
                 return False
         return True
     
-    def _get_unique_values(self, X, attr_idx):
-        """특정 속성의 유일한 값들 반환"""
-        return set(x[attr_idx] for x in X)
+    def _get_unique_values(self, X, attr_col_idx):
+        """특정 속성의 유일한 값들을 정렬해서 반환"""
+        return sorted(set(x[attr_col_idx] for x in X))
     
-    def _select_best_attribute(self, X, y, attributes) -> int:
+    def _select_best_attribute(self, X, y, attributes):
         """gain ratio가 가장 높은 속성 선택"""
         n_features = len(attributes)
         
-        max_gain_ratio = -float('inf')
+        max_gain_ratio = 0.0  # 0 이하는 고려하지 않음
         best_attr_idx = -1
         
         for i in range(n_features):
-            gain_ratio = self._gain_ratio(X, y, i)
+            attr_name = attributes[i]
+            attr_col_idx = self.attr_names.index(attr_name)  # X 데이터에서의 열 인덱스
+            
+            # 정보 이득과 분할 정보 계산
+            info_gain = self._info_gain(X, y, attr_col_idx)
+            split_info = self._split_info(X, attr_col_idx)
+            
+            # 분할 정보가 0이거나 매우 작은 경우 건너뛰기
+            if split_info < 0.01:
+                continue
+            
+            # 이득 비율 계산
+            gain_ratio = info_gain / split_info
+            
+            # 최소 정보 이득 임계값 검사 (노이즈 방지)
+            if info_gain < 0.01:
+                continue
+            
+            # 최대 이득 비율 갱신
             if gain_ratio > max_gain_ratio:
                 max_gain_ratio = gain_ratio
                 best_attr_idx = i
         
-        # print("best_attr_idx", best_attr_idx)
         return best_attr_idx
     
     def _entropy(self, y) -> float:
@@ -118,7 +182,6 @@ class DecisionTree:
             return 0
         
         counts = Counter(y)
-        # print("counts", counts) # 각 클래스의 개수
         # 엔트로피 계산
         entropy = 0
         for count in counts.values():
@@ -127,7 +190,7 @@ class DecisionTree:
         
         return entropy
     
-    def _info_gain(self, X, y, attr_idx):
+    def _info_gain(self, X, y, attr_col_idx):
         """정보 이득 계산"""
         n = len(y)
         
@@ -135,46 +198,34 @@ class DecisionTree:
         parent_entropy = self._entropy(y)
         
         # 속성으로 분할 후 가중 엔트로피
-        values = self._get_unique_values(X, attr_idx)
-        # print("values", values)
+        values = self._get_unique_values(X, attr_col_idx)
         weighted_entropy = 0
         
         for value in values:
-            indices = [i for i, x in enumerate(X) if x[attr_idx] == value]
+            indices = [i for i, x in enumerate(X) if x[attr_col_idx] == value]
             subset_y = [y[i] for i in indices]
             
             weight = len(subset_y) / n
-            weighted_entropy += weight * self._entropy(subset_y)
+            subset_entropy = self._entropy(subset_y)
+            weighted_entropy += weight * subset_entropy
         
         # 정보 이득 = 분할 전 엔트로피 - 분할 후 가중 엔트로피
         info_gain = parent_entropy - weighted_entropy
-        # print("info_gain", info_gain)
         return info_gain
     
-    def _split_info(self, X, attr_idx):
+    def _split_info(self, X, attr_col_idx):
         """분할 정보 계산 (split information)"""
         n = len(X)
-        values = self._get_unique_values(X, attr_idx)
+        values = self._get_unique_values(X, attr_col_idx)
         
         split_info = 0
         for value in values:
-            count = sum(1 for x in X if x[attr_idx] == value)
+            count = sum(1 for x in X if x[attr_col_idx] == value)
             proportion = count / n
             if proportion > 0:
                 split_info -= proportion * math.log2(proportion)
         
         return split_info
-    
-    def _gain_ratio(self, X, y, attr_idx):
-        """이득 비율 계산 (gain ratio)"""
-        info_gain = self._info_gain(X, y, attr_idx)
-        split_info = self._split_info(X, attr_idx)
-        
-        # 분모가 0인 경우 처리
-        if split_info == 0:
-            return 0
-        
-        return info_gain / split_info
     
     def predict(self, X):
         """여러 샘플에 대한 예측 수행"""
@@ -190,28 +241,16 @@ class DecisionTree:
             
             # 트리에 없는 속성값 처리
             if attr_value not in node.children:
-                # 가장 일반적인 자식 선택
-                counts = Counter(y for _, y in self.get_node_distribution(node))
-                node = DecisionTreeNode(is_leaf=True, label=counts.most_common(1)[0][0])
+                # 현재 노드의 클래스 분포를 기반으로 예측
+                if node.class_distribution:
+                    return self._get_majority_class(node.class_distribution)
+                else:
+                    # 클래스 분포가 없는 경우 기본값 반환
+                    return self.classes[0] if self.classes else None
             else:
                 node = node.children[attr_value]
         
         return node.label
-    
-    def get_node_distribution(self, node):
-        """노드에서의 클래스 분포 반환 (디버깅용)"""
-        if node.is_leaf:
-            return [(None, node.label)]
-        
-        result = []
-        for value, child in node.children.items():
-            if child.is_leaf:
-                result.append((value, child.label))
-            else:
-                sub_dist = self.get_node_distribution(child)
-                result.extend([(value + "->" + sub_val if sub_val else value, label) 
-                               for sub_val, label in sub_dist])
-        return result
 
 def read_data(filename):
     """파일에서 데이터 읽기"""
@@ -273,14 +312,13 @@ def main():
     
     # 학습 데이터 읽기
     train_data, train_header = read_data(train_file)
-    # print("train_data", train_data)
-    # print("train_header", train_header)
     
     # 테스트 데이터 읽기
     test_data, test_header = read_data(test_file)
     
-    # 결정 트리 학습
-    tree = DecisionTree()
+    # 결정 트리 학습 (최대 깊이 및 최소 샘플 수 설정)
+    # 자동차 데이터셋은 속성이 6개이므로 깊이 10은 충분함
+    tree = DecisionTree(max_depth=10, min_samples_split=2)
     tree.fit(train_data, train_header)
     
     # 테스트 데이터 예측
